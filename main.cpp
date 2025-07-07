@@ -1,17 +1,29 @@
 // main.cpp
 #include <opencv2/opencv.hpp>
 #include <tesseract/baseapi.h>
+#include <nlohmann/json.hpp>
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <filesystem>
 #include <algorithm>
 
+using json = nlohmann::json;
 using namespace cv;
 using namespace std;
 namespace fs = std::filesystem;
 
+// 이미지 처리 결과 디렉토리
 string output_dir = "results";
+
+//OCR 결과 구조체
+struct OcrResult {
+    int number;
+    int reliability;    // 0: 하단만 정확, 1: 상+하단 정확, -1: 실패
+    string lpNum;
+    bool success;
+};
 
 // 이미지 처리 과정 저장
 void save(const Mat& img, const string& filename) {
@@ -50,14 +62,14 @@ void remove_side_dots(Mat& img) {
     save(img, "08_upper_cover.png");
 }
 // 상/하단 분리
-void split_plate(const Mat& plate, Mat& upper, Mat& lower, float upper_ratio = 0.4, float lower_start_ratio = 0.3) {
-    int h = plate.rows;
-    int upper_y = static_cast<int>(h * upper_ratio);
-    int lower_y = static_cast<int>(h * lower_start_ratio);
+// void split_plate(const Mat& plate, Mat& upper, Mat& lower, float upper_ratio = 0.4, float lower_start_ratio = 0.3) {
+//     int h = plate.rows;
+//     int upper_y = static_cast<int>(h * upper_ratio);
+//     int lower_y = static_cast<int>(h * lower_start_ratio);
 
-    upper = plate(Range(0, upper_y), Range::all()).clone();
-    lower = plate(Range(lower_y, h), Range::all()).clone();
-}
+//     upper = plate(Range(0, upper_y), Range::all()).clone();
+//     lower = plate(Range(lower_y, h), Range::all()).clone();
+// }
 
 // OCR 전처리
 Mat preprocess(const Mat& input, float resize_factor = 3) {
@@ -91,134 +103,173 @@ string ocr_kor(const Mat& image, const string& whitelist) {
     tess.End();
     return out;
 }
-
-int main() {
-    if (fs::exists(output_dir)) {
-        cout << "📁 기존 출력 폴더 존재함: " << output_dir << " → 삭제 중..." << endl;
-
-        for (const auto& entry : fs::directory_iterator(output_dir)) {
-            fs::remove_all(entry);  // 파일 또는 서브디렉토리 전부 제거
-        }
-
-        cout << "✅ 폴더 초기화 완료!" << endl;
-    } else {
-        fs::create_directory(output_dir);
-        cout << "📁 출력 폴더 생성됨: " << output_dir << endl;
-    }
-
-    string image_path = "/home/Qwd/cplus2/0_1_original.jpg";
-    Mat cropped_img = imread(image_path);
-
-    if(cropped_img.empty()) {
-        cerr << "이미지를 불러올 수 없습니다!" << endl;
-        return -1;
-    }
-    cout << "===== 번호판 추출 시작 =====" << endl;
-    
-    // 1. HSV
+bool extract_plate_region(const Mat& input, Mat& output_plate, const string& prefix) {
     Mat hsv;
-    cvtColor(cropped_img, hsv, COLOR_BGR2HSV);
-    save(hsv, "01_hsv.png");
+    cvtColor(input, hsv, COLOR_BGR2HSV);
+    save(hsv, prefix + "01_hsv.png");
 
-    // 2. Yellow masking
+    // 1. 노란색 마스크
     Scalar lower_yellow(15, 100, 100);
     Scalar upper_yellow(35, 255, 255);
-
     Mat mask;
     inRange(hsv, lower_yellow, upper_yellow, mask);
-    save(mask, "02_yellow_mask.png");
+    save(mask, prefix + "02_yellow_mask.png");
 
+    // 2. 노란 영역 추출
     Mat masked;
-    bitwise_and(cropped_img, cropped_img, masked, mask);
-    save(masked, "03_yellow_region.png");
+    bitwise_and(input, input, masked, mask);
+    save(masked, prefix + "03_yellow_region.png");
 
-    // 3. 전처리
+    // 3. 엣지 추출
     Mat gray, blur, edges;
     cvtColor(masked, gray, COLOR_BGR2GRAY);
     GaussianBlur(gray, blur, Size(5, 5), 0);
     Canny(blur, edges, 50, 150);
-    save(edges, "04_edges.png");
+    save(edges, prefix + "04_edges.png");
 
     // 4. 윤곽선 탐색
     vector<vector<Point>> contours;
     findContours(edges, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
-
     vector<Point> candidate;
-    
-    for(const auto& cnt : contours) {
+
+    for (const auto& cnt : contours) {
         vector<Point> approx;
         approxPolyDP(cnt, approx, 0.02 * arcLength(cnt, true), true);
         double area = contourArea(approx);
-
         if (approx.size() == 4 && area > 500) {
             candidate = approx;
             break;
         }
     }
-    
-    if (!candidate.empty()) {
-        // 5. 꼭짓점 찾기
-        vector<Point2f> corners = order_points(candidate);
 
-        // 점 찍기
-        Mat temp = cropped_img.clone();
-        for (const auto& pt : corners) {
-            circle(temp, pt, 5, Scalar(0, 255, 0), -1);
-        }
-        save(temp, "05_detected_corners.png");
-
-        // 6. 번호판 영역 잘라내기
-        Point2f tl = corners[0];
-        Point2f tr = corners[1];
-        Point2f br = corners[2];
-        Point2f bl = corners[3];
-
-        int width = static_cast<int>(max(norm(br - bl), norm(tr - tl)));
-        int height = static_cast<int>(max(norm(tr - br), norm(tl - bl)));
-
-        vector<Point2f> dst_pts = {
-            Point2f(0, 0),
-            Point2f(width - 1, 0),
-            Point2f(width - 1, height - 1),
-            Point2f(0, height - 1)
-        };
-
-        // 7. 원근 변환
-        Mat M = getPerspectiveTransform(corners, dst_pts);
-        Mat warped;
-        warpPerspective(cropped_img, warped, M, Size(width, height));
-        save(warped, "06_warped_plate.png");
-
-        // 8. 전처리 및 OCR 호출
-        // split
-        Mat upper, lower;
-        split_plate(warped, upper, lower);
-
-        // preprocess
-        Mat bin_upper = preprocess(upper);
-        Mat bin_lower = preprocess(lower);
-
-        remove_side_dots(bin_upper);
-
-        save(bin_upper, "07_upper.png");
-        save(bin_lower, "08_lower.png");
-
-        // ocr
-        //string upper_text = ocr_eng(bin_upper, "0123456789");
-        string lower_text = ocr_kor(bin_lower, "0123456789가나다라마바사아자하허호거너더러머버서어저고노도로모보소오조구누두루무부수우주배");
-        string upper_text = ocr_kor(bin_upper, "0123456789가나다라마바사아자하허호거너더러머버서어저고노도로모보소오조구누두루무부수우주배");
-
-        // clean text
-        string cleaned_upper, cleaned_lower;
-        for (char c : upper_text) if (isdigit(c)) cleaned_upper += c;
-        for (char c : lower_text) if (isdigit(c) || (c & 0x80)) cleaned_lower += c;
-
-        cout << "🔹 상단 인식 결과: " << cleaned_upper << endl;
-        cout << "🔸 하단 인식 결과: " << cleaned_lower << endl;
-    } else {
-        std::cout << "사각형 후보를 찾지 못했습니다!" << std::endl;
+    if (candidate.empty()) {
+        cout << "❌ 번호판 후보 사각형을 찾지 못함" << endl;
+        return false;
     }
 
-    cout << "===== 번호판 추출 완료 =====" << endl;
+    // 5. 원근 보정
+    vector<Point2f> corners = order_points(candidate);
+
+    // 시각화
+    Mat temp = input.clone();
+    for (const auto& pt : corners)
+        circle(temp, pt, 5, Scalar(0, 255, 0), -1);
+    save(temp, prefix + "05_detected_corners.png");
+
+    Point2f tl = corners[0], tr = corners[1], br = corners[2], bl = corners[3];
+    int width = static_cast<int>(max(norm(br - bl), norm(tr - tl)));
+    int height = static_cast<int>(max(norm(tr - br), norm(tl - bl)));
+
+    float fx = static_cast<float>(width - 1);
+    float fy = static_cast<float>(height - 1);
+
+    vector<Point2f> dst_pts = {
+        {0.0f, 0.0f},
+        {fx, 0.0f},
+        {fx, fy},
+        {0.0f, fy}
+    };
+
+    Mat M = getPerspectiveTransform(corners, dst_pts);
+    warpPerspective(input, output_plate, M, Size(width, height));
+    save(output_plate, prefix + "06_warped_plate.png");
+
+    return true;
+}
+
+OcrResult process_plate(const Mat& input_img, int index) {
+    OcrResult result;
+    result.number = index;
+    result.reliability = -1;
+    result.lpNum = "";
+    result.success = false;
+
+    Mat plate_img;
+    if (!extract_plate_region(input_img, plate_img, "img_" + to_string(index) + "_")) {
+        // 번호판 검출 실패
+        cout << "❌ [" << index << "] 번호판 사각형 추출 실패" << endl;
+        return result;  //success = false 유지
+    }
+
+    // 1. 상/하단 분리
+    Mat upper, lower;
+    int h = plate_img.rows;
+    upper = plate_img(Range(0, int(h * 0.4)), Range::all()).clone();
+    lower = plate_img(Range(int(h * 0.3), h), Range::all()).clone();
+
+    // 2. ocr 전처리
+    Mat bin_upper = preprocess(upper);
+    Mat bin_lower = preprocess(lower);
+
+    remove_side_dots(bin_upper);
+
+    // 3. OCR (Tesseract 호출)
+    string upper_text = ocr_eng(bin_upper, "0123456789");
+    string lower_text = ocr_kor(bin_lower, "0123456789가나다라마바사아자하허호");
+
+    // 4. 텍스트 정리
+    string cleaned_upper, cleaned_lower;
+    for (char c : upper_text) if (isdigit(c)) cleaned_upper += c;
+    for (char c : lower_text) if (isdigit(c) || (c & 0x80)) cleaned_lower += c;
+
+    // 5. 판단
+    result.reliability = (!cleaned_upper.empty() && !cleaned_lower.empty()) ? 1 :
+                         (!cleaned_lower.empty()) ? 0 : -1;
+    result.lpNum = cleaned_upper + " " + cleaned_lower;
+    result.success = (result.reliability != -1);
+
+    return result;
+}
+
+
+int main() {
+    vector<OcrResult> results;
+    int pass = 0, fail = 0;
+    int index = 0;
+
+    if (!fs::exists(output_dir)) {
+        cout << "📂 result 폴더 생성 중 ..." << endl;
+        fs::create_directory(output_dir);
+        cout << "📂 result 폴더 생성 완료" << endl;
+    } else {
+        cout << "📂 result 폴더 이미 존재합니다." << endl;
+    }
+
+    for (const auto& entry : fs::directory_iterator("images")) {
+        if (!entry.is_regular_file()) continue;
+
+        Mat img = imread(entry.path().string());
+        if (img.empty()) {
+            cerr << "❌ 이미지 로딩 실패: " << entry.path() << endl;
+            continue;
+        }
+
+        OcrResult res = process_plate(img, index);
+        results.push_back(res);
+
+        if (res.success) pass++;
+        else fail++;
+
+        index++;
+    }
+    json j;
+    j["pass"] = pass;
+    j["fail"] = fail;
+    j["buses"] = json::array();
+
+    for (const auto& r : results) {
+        j["buses"].push_back({
+            {"number", r.number},
+            {"reliability", r.reliability},
+            {"lpNum", r.lpNum}
+        });
+    }
+
+    ofstream file(output_dir + "/result.json");
+    file << j.dump(4);
+    file.close();
+
+    cout << "✅ OCR JSON 저장 완료: " << output_dir + "/result.json" << endl;
+
     return 0;
 }
