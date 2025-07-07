@@ -8,6 +8,7 @@
 #include <vector>
 #include <filesystem>
 #include <algorithm>
+#include <regex>
 
 using json = nlohmann::json;
 using namespace cv;
@@ -55,43 +56,13 @@ void remove_side_dots(Mat& img) {
     // mm → 비율 → 픽셀
     int margin_px = static_cast<int>(img_width * (70.0 / 335.0));  // 약 21% = 0.209
     // 흰색으로 덮기
-    rectangle(img, Point(0, 0), Point(margin_px, img_height), Scalar(255, 255, 255), FILLED);
+    rectangle(img, Point(0, 0), Point(img_width / 2, img_height), Scalar(255, 255, 255), FILLED);
     rectangle(img, Point(img_width - margin_px, 0), Point(img_width, img_height), Scalar(255, 255, 255), FILLED);
 
     cout << "=== 특정 영역 흰색으로 덮었습니다. ===" << endl;
-    save(img, "08_upper_cover.png");
 }
-// 상/하단 분리
-// void split_plate(const Mat& plate, Mat& upper, Mat& lower, float upper_ratio = 0.4, float lower_start_ratio = 0.3) {
-//     int h = plate.rows;
-//     int upper_y = static_cast<int>(h * upper_ratio);
-//     int lower_y = static_cast<int>(h * lower_start_ratio);
 
-//     upper = plate(Range(0, upper_y), Range::all()).clone();
-//     lower = plate(Range(lower_y, h), Range::all()).clone();
-// }
 
-// OCR 전처리
-Mat preprocess(const Mat& input, float resize_factor = 3) {
-    Mat gray, resized, binary, kernel;
-    cvtColor(input, gray, COLOR_BGR2GRAY);
-    resize(gray, resized, Size(), resize_factor, resize_factor, INTER_CUBIC);
-    threshold(resized, binary, 0, 255, THRESH_BINARY | THRESH_OTSU);
-    kernel = getStructuringElement(MORPH_CROSS, Size(3, 3));
-    dilate(binary, binary, kernel, Point(-1, -1), 1);
-    return binary;
-}
-// upper img OCR
-string ocr_eng(const Mat& image, const string& whitelist) {
-    tesseract::TessBaseAPI tess;
-    tess.Init(NULL, "eng", tesseract::OEM_LSTM_ONLY);
-    tess.SetVariable("tessedit_char_whitelist", whitelist.c_str());
-    tess.SetPageSegMode(tesseract::PSM_SINGLE_LINE);
-    tess.SetImage(image.data, image.cols, image.rows, 1, image.step);
-    string out = tess.GetUTF8Text();
-    tess.End();
-    return out;
-}
 // lower img OCR
 string ocr_kor(const Mat& image, const string& whitelist) {
     tesseract::TessBaseAPI tess;
@@ -103,14 +74,55 @@ string ocr_kor(const Mat& image, const string& whitelist) {
     tess.End();
     return out;
 }
+
+// 정규식 검증용
+bool validate_lower_pattern(const string& str) {
+    // 1. UTF-8 문자열을 각 문자를 제대로 다룰 수 있는 wstring으로 변환
+    wstring_convert<codecvt_utf8<wchar_t>> conv;
+    wstring wstr = conv.from_bytes(str);
+
+    // 2. 5글자인지 확인
+    if (wstr.length() != 5) return false;
+
+    // 3. 첫 번째 글자가 한글인지 확인
+    if (!(wstr[0] >= L'가' && wstr[0] <= L'힣')) return false;
+    
+    // 4. 나머지 네 글자가 모두 숫자인지 확인
+    for (int i = 1; i < 5; ++i) if (!iswdigit(wstr[i])) return false;
+    return true;
+}
+
+// OCR 전처리
+Mat preprocess(const Mat& input, float resize_factor = 2.7) {
+    Mat gray, resized, binary, kernel;
+    cvtColor(input, gray, COLOR_BGR2GRAY);
+    resize(gray, resized, Size(), resize_factor, resize_factor, INTER_CUBIC);
+    
+    kernel = getStructuringElement(MORPH_RECT, Size(15, 15));
+    Mat background;
+    morphologyEx(resized, background, MORPH_CLOSE, kernel);
+    Mat diff;
+    absdiff(resized, background, diff);
+    bitwise_not(diff, diff);
+
+    threshold(diff, binary, 0, 255, THRESH_BINARY | THRESH_OTSU);
+    kernel = getStructuringElement(MORPH_CROSS, Size(3, 3));
+    dilate(binary, binary, kernel, Point(-1, -1), 1);
+    return binary;
+}
+
 bool extract_plate_region(const Mat& input, Mat& output_plate, const string& prefix) {
     Mat hsv;
     cvtColor(input, hsv, COLOR_BGR2HSV);
     save(hsv, prefix + "01_hsv.png");
 
-    // 1. 노란색 마스크
-    Scalar lower_yellow(15, 100, 100);
-    Scalar upper_yellow(35, 255, 255);
+    // // 1. 노란색 마스크
+    // Scalar lower_yellow(15, 100, 100);
+    // Scalar upper_yellow(35, 255, 255);
+    // 확장된 범위 (어두운 노랑 허용)
+    Scalar lower_yellow(10,  50,  50);  // Hue 약간 낮추고, Saturation/Value도 완화
+    Scalar upper_yellow(40, 255, 255);
+
     Mat mask;
     inRange(hsv, lower_yellow, upper_yellow, mask);
     save(mask, prefix + "02_yellow_mask.png");
@@ -202,21 +214,51 @@ OcrResult process_plate(const Mat& input_img, int index) {
     Mat bin_lower = preprocess(lower);
 
     remove_side_dots(bin_upper);
+    save(bin_upper, "img_" + to_string(index) + "_" + "07_upper_image.png");
+    save(bin_lower, "img_" + to_string(index) + "_" + "07_lower_image.png");
 
     // 3. OCR (Tesseract 호출)
-    string upper_text = ocr_eng(bin_upper, "0123456789");
+    string upper_text = ocr_kor(bin_upper, "0123456789");
     string lower_text = ocr_kor(bin_lower, "0123456789가나다라마바사아자하허호");
 
     // 4. 텍스트 정리
+    upper_text.erase(remove(upper_text.begin(), upper_text.end(), '\n'), upper_text.end());
+    lower_text.erase(remove(lower_text.begin(), lower_text.end(), '\n'), lower_text.end());
+    
     string cleaned_upper, cleaned_lower;
+    
     for (char c : upper_text) if (isdigit(c)) cleaned_upper += c;
-    for (char c : lower_text) if (isdigit(c) || (c & 0x80)) cleaned_lower += c;
+    cleaned_lower = lower_text;
 
-    // 5. 판단
-    result.reliability = (!cleaned_upper.empty() && !cleaned_lower.empty()) ? 1 :
-                         (!cleaned_lower.empty()) ? 0 : -1;
-    result.lpNum = cleaned_upper + " " + cleaned_lower;
-    result.success = (result.reliability != -1);
+    cout << "[" << index << "] upper_text: " << upper_text << endl;
+    cout << "[" << index << "] lower_text: " << lower_text << endl;
+    cout << "[" << index << "] cleaned_upper: [" << cleaned_upper << "]" << endl;
+    cout << "[" << index << "] cleaned_lower: [" << cleaned_lower << "]" << endl;
+
+    //5. 정규식 검증
+    regex upper_pattern("^[0-9]{2}$");
+
+    bool upper_valid = regex_match(cleaned_upper, upper_pattern);
+    bool lower_valid = validate_lower_pattern(cleaned_lower);
+
+    cout << "[" << index << "] upper_valid: " << upper_valid << endl;
+    cout << "[" << index << "] lower_valid: " << lower_valid << endl;
+
+    // 6. 판단
+    result.lpNum = cleaned_upper + cleaned_lower;
+
+    if (lower_valid && upper_valid) { // 상,하단 모두 부합
+        result.reliability = 1;
+        cout << "정규식 일치" << endl;
+    }
+    else if (lower_valid) {          // 하단만 부합
+        result.reliability = 0;
+        cout << "정규식 일부 일치" << endl;
+    }
+    else                            // 규칙 위배
+        result.reliability = -1;
+
+    result.success = (result.reliability == 1);
 
     return result;
 }
@@ -235,7 +277,7 @@ int main() {
         cout << "📂 result 폴더 이미 존재합니다." << endl;
     }
 
-    for (const auto& entry : fs::directory_iterator("images")) {
+    for (const auto& entry : fs::directory_iterator("../images")) {
         if (!entry.is_regular_file()) continue;
 
         Mat img = imread(entry.path().string());
